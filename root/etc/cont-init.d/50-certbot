@@ -29,6 +29,19 @@ if [[ "${VALIDATION}" = "dns" ]] && [[ ! "${DNSPLUGIN}" =~ ^(acmedns|aliyun|azur
     sleep infinity
 fi
 
+# call option with parameters: $1=name $2=value $3=file
+function option() {
+    name=${1//\//\\/}
+    value=${2//\//\\/}
+    sed -i \
+        -e '/^#\?\(\s*'"${name}"'\s*=\s*\).*/{s//\1'"${value}"'/;:a;n;ba;q}' \
+        -e '$a'"${name}"'='"${value}" "${3}"
+}
+
+# ensure config files exist
+touch /config/etc/letsencrypt/cli.ini
+option "agree-tos" "true" /config/etc/letsencrypt/cli.ini
+
 # copy dns default configs
 cp -n /defaults/dns-conf/* /config/dns-conf/
 chown -R abc:abc /config/dns-conf
@@ -187,52 +200,57 @@ else
     ACMESERVER="https://acme-v02.api.letsencrypt.org/directory"
 fi
 
+echo "server = ${ACMESERVER}" >>/config/etc/letsencrypt/cli.ini
+
 # figuring out url only vs url & subdomains vs subdomains only
 if [[ -n "${SUBDOMAINS}" ]]; then
     echo "SUBDOMAINS entered, processing"
     if [[ "${SUBDOMAINS}" = "wildcard" ]]; then
         if [[ "${ONLY_SUBDOMAINS}" = true ]]; then
-            export URL_REAL="-d *.${URL}"
+            export URL_REAL="*.${URL}"
             echo "Wildcard cert for only the subdomains of ${URL} will be requested"
         else
-            export URL_REAL="-d *.${URL} -d ${URL}"
+            export URL_REAL="*.${URL},${URL}"
             echo "Wildcard cert for ${URL} will be requested"
         fi
     else
         echo "SUBDOMAINS entered, processing"
         for job in $(echo "${SUBDOMAINS}" | tr "," " "); do
-            export SUBDOMAINS_REAL="${SUBDOMAINS_REAL} -d ${job}.${URL}"
+            export SUBDOMAINS_REAL="${SUBDOMAINS_REAL},${job}.${URL}"
         done
         if [[ "${ONLY_SUBDOMAINS}" = true ]]; then
             URL_REAL="${SUBDOMAINS_REAL}"
             echo "Only subdomains, no URL in cert"
         else
-            URL_REAL="-d ${URL}${SUBDOMAINS_REAL}"
+            URL_REAL="${URL}${SUBDOMAINS_REAL}"
         fi
         echo "Sub-domains processed are: ${SUBDOMAINS_REAL}"
     fi
 else
     echo "No subdomains defined"
-    URL_REAL="-d ${URL}"
+    URL_REAL="${URL}"
 fi
 
 # add extra domains
 if [[ -n "${EXTRA_DOMAINS}" ]]; then
     echo "EXTRA_DOMAINS entered, processing"
     for job in $(echo "${EXTRA_DOMAINS}" | tr "," " "); do
-        export EXTRA_DOMAINS_REAL="${EXTRA_DOMAINS_REAL} -d ${job}"
+        export EXTRA_DOMAINS_REAL="${EXTRA_DOMAINS_REAL},${job}"
     done
     echo "Extra domains processed are: ${EXTRA_DOMAINS_REAL}"
-    URL_REAL="${URL_REAL} ${EXTRA_DOMAINS_REAL}"
+    URL_REAL="${URL_REAL}${EXTRA_DOMAINS_REAL}"
 fi
+option "domains" "${URL_REAL}" /config/etc/letsencrypt/cli.ini
 
 # figuring out whether to use e-mail and which
 if [[ ${EMAIL} == *@* ]]; then
     echo "E-mail address entered: ${EMAIL}"
-    EMAILPARAM="-m ${EMAIL} --no-eff-email"
+    option "email" "${EMAIL}" /config/etc/letsencrypt/cli.ini
+    option "no-eff-email" "true" /config/etc/letsencrypt/cli.ini
+    option "register-unsafely-without-email" "false" /config/etc/letsencrypt/cli.ini
 else
     echo "No e-mail address entered or address invalid"
-    EMAILPARAM="--register-unsafely-without-email"
+    option "register-unsafely-without-email" "true" /config/etc/letsencrypt/cli.ini
 fi
 
 # alter extension for error message
@@ -244,37 +262,41 @@ fi
 
 # setting the validation method to use
 if [[ "${VALIDATION}" = "dns" ]]; then
-    AUTHENTICATORPARAM="--authenticator dns-${DNSPLUGIN}"
-    DNSCREDENTIALSPARAM="--dns-${DNSPLUGIN}-credentials ${DNSCREDENTIALFILE}"
-    if [[ -n "${PROPAGATION}" ]]; then PROPAGATIONPARAM="--dns-${DNSPLUGIN}-propagation-seconds ${PROPAGATION}"; fi
+    option "preferred-challenges" "dns" /config/etc/letsencrypt/cli.ini
+    option "authenticator" "dns-${DNSPLUGIN}" /config/etc/letsencrypt/cli.ini
+    option "dns-${DNSPLUGIN}-credentials" "${DNSCREDENTIALFILE}" /config/etc/letsencrypt/cli.ini
+    if [[ -n "${PROPAGATION}" ]]; then option "dns-${DNSPLUGIN}-propagation-seconds" "${PROPAGATION}" /config/etc/letsencrypt/cli.ini; fi
 
     # plugins that don't support setting credentials file
     if [[ "${DNSPLUGIN}" =~ ^(route53|standalone)$ ]]; then
-        DNSCREDENTIALSPARAM=""
+        sed "/^dns-${DNSPLUGIN}-credentials /d" /config/etc/letsencrypt/cli.ini
     fi
     # plugins that don't support setting propagation
     if [[ "${DNSPLUGIN}" =~ ^(azure|gandi|standalone)$ ]]; then
         if [[ -n "${PROPAGATION}" ]]; then echo "${DNSPLUGIN} dns plugin does not support setting propagation time"; fi
-        PROPAGATIONPARAM=""
+        sed "/^dns-${DNSPLUGIN}-propagation-seconds /d" /config/etc/letsencrypt/cli.ini
     fi
     # plugins that use old parameter naming convention
     if [[ "${DNSPLUGIN}" =~ ^(cpanel|directadmin)$ ]]; then
-        AUTHENTICATORPARAM="--authenticator ${DNSPLUGIN}"
-        DNSCREDENTIALSPARAM="--${DNSPLUGIN}-credentials ${DNSCREDENTIALFILE}"
-        if [[ -n "${PROPAGATION}" ]]; then PROPAGATIONPARAM="--${DNSPLUGIN}-propagation-seconds ${PROPAGATION}"; fi
+        sed "/^dns-${DNSPLUGIN}-credentials /d" /config/etc/letsencrypt/cli.ini
+        sed "/^dns-${DNSPLUGIN}-propagation-seconds /d" /config/etc/letsencrypt/cli.ini
+        option "authenticator" "${DNSPLUGIN}" /config/etc/letsencrypt/cli.ini
+        option "${DNSPLUGIN}-credentials" "${DNSCREDENTIALFILE}" /config/etc/letsencrypt/cli.ini
+        if [[ -n "${PROPAGATION}" ]]; then option "${DNSPLUGIN}-propagation-seconds" "${PROPAGATION}" /config/etc/letsencrypt/cli.ini; fi
     fi
     # don't restore txt records when using DuckDNS plugin
     if [[ "${DNSPLUGIN}" =~ ^(duckdns)$ ]]; then
-        AUTHENTICATORPARAM="${AUTHENTICATORPARAM} --dns-${DNSPLUGIN}-no-txt-restore"
+        option "dns-${DNSPLUGIN}-no-txt-restore" "true" /config/etc/letsencrypt/cli.ini
     fi
 
-    PREFCHAL="${AUTHENTICATORPARAM} ${DNSCREDENTIALSPARAM} ${PROPAGATIONPARAM}"
     echo "${VALIDATION} validation via ${DNSPLUGIN} plugin is selected"
 elif [[ "${VALIDATION}" = "tls-sni" ]]; then
-    PREFCHAL="--standalone --preferred-challenges http"
+    option "preferred-challenges" "http" /config/etc/letsencrypt/cli.ini
+    option "authenticator" "standalone" /config/etc/letsencrypt/cli.ini
     echo "*****tls-sni validation has been deprecated, attempting http validation instead"
 else
-    PREFCHAL="--standalone --preferred-challenges http"
+    option "preferred-challenges" "http" /config/etc/letsencrypt/cli.ini
+    option "authenticator" "standalone" /config/etc/letsencrypt/cli.ini
     echo "http validation is selected"
 fi
 
@@ -289,11 +311,11 @@ if [[ ! -f "/config/keys/letsencrypt/fullchain.pem" ]]; then
             echo "Unable to retrieve EAB credentials from ZeroSSL. Check the outgoing connections to api.zerossl.com and dns. Sleeping."
             sleep infinity
         fi
-        ZEROSSL_EAB="--eab-kid ${ZEROSSL_EAB_KID} --eab-hmac-key ${ZEROSSL_EAB_HMAC_KEY}"
+        option "eab-kid" "${ZEROSSL_EAB_KID}" /config/etc/letsencrypt/cli.ini
+        option "eab-hmac-key" "${ZEROSSL_EAB_HMAC_KEY}" /config/etc/letsencrypt/cli.ini
     fi
     echo "Generating new certificate"
-    # shellcheck disable=SC2086
-    certbot certonly --non-interactive --renew-by-default --server ${ACMESERVER} ${ZEROSSL_EAB} ${PREFCHAL} --rsa-key-size 4096 ${EMAILPARAM} --agree-tos ${URL_REAL}
+    certbot certonly --non-interactive --renew-by-default
     if [[ ! -d /config/keys/letsencrypt ]]; then
         if [[ "${VALIDATION}" = "dns" ]]; then
             echo "ERROR: Cert does not exist! Please see the validation error above. Make sure you entered correct credentials into the ${DNSCREDENTIALFILE} file."
